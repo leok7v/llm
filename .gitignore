@@ -1,0 +1,20 @@
+# Compiled binaries and object files
+llm
+train_bpe
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+
+# Training outputs, regenerable from the sources + datasets in this repo
+weights.bin
+merges.bin
+
+# Editor config, local to my setup, not part of the C project
+.vscode/
+
+# macOS
+.DS_Store
+
+llm_sandbox.c
