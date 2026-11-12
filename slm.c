@@ -900,9 +900,10 @@ static int32_t bpe(void) {
 static int32_t train(void) {
     const int32_t batch = option_int("batch", 2);
     const int32_t epochs = option_int("epochs", 30);
+    const int32_t patience = option_int("patience", 1);
     struct tokenizer tk = { 0 };
     int32_t bytes = 0;
-    must(batch > 0, "batch");
+    must(batch > 0 && epochs > 0 && patience > 0, "batch, epochs, patience");
     tokenizer_load(&tk, args[2]);
     char * text = file_read(args[3], &bytes);
     int32_t * ids = bytes_to_ids(text, bytes, 0);
@@ -918,7 +919,9 @@ static int32_t train(void) {
     float * v = take(PARAMS);
     printf("%d tokens, %d steps of batch %d, gemm %s\n", n, steps, batch,
            backend.name);
-    for (int32_t epoch = 0; epoch < epochs; epoch++) {
+    double best = INFINITY;
+    int32_t stale = 0;
+    for (int32_t epoch = 0; epoch < epochs && stale < patience; epoch++) {
         const double start = seconds();
         double sum = 0.0;
         for (int32_t i = 0; i < steps; i++) {
@@ -926,13 +929,19 @@ static int32_t train(void) {
             adamw(w.tok, d.tok, m, v, epoch * steps + i + 1);
         }
         const double val = evaluate(&w, ids + fit, n - fit, batch);
-        printf("epoch %2d | train %.4f | val %.4f | %.1fs\n", epoch + 1,
-               sum / steps, val, seconds() - start);
+        stale = val < best ? 0 : stale + 1;
+        if (stale == 0) {
+            best = val;
+            weights_save(&w, "weights.bin");
+        }
+        printf("epoch %2d | train %.4f | val %.4f | %.1fs%s\n", epoch + 1,
+               sum / steps, val, seconds() - start,
+               stale == 0 ? " | saved" : "");
     }
-    printf("final train %.4f | val %.4f\n", evaluate(&w, ids, fit, batch),
+    must(weights_load(&w, "weights.bin"), "weights.bin");
+    printf("best train %.4f | val %.4f\n", evaluate(&w, ids, fit, batch),
            evaluate(&w, ids + fit, n - fit, batch));
     generate(&w, &tk, "I HAD always thought", 30);
-    weights_save(&w, "weights.bin");
     free(ids);
     free(text);
     return 0;
@@ -1075,7 +1084,8 @@ static int32_t usage(void) {
                     "       slm run <merges.bin> <prompt>\n"
                     "       slm check | bench\n"
                     "options: gemm=cpu|blas|metal|mps|both batch=2 epochs=30\n"
-                    "         seed=N tokens=10 min=N share=30 rounds=6\n");
+                    "         seed=N tokens=10 min=N share=30 rounds=6\n"
+                    "         patience=1\n");
     return 1;
 }
 
