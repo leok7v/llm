@@ -3,6 +3,7 @@
 #include <Metal/Metal.h>
 #include <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #include <assert.h>
+#include <ctype.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -21,12 +22,15 @@ enum {
     HEADS   = 8,
     HEAD    = EMB / HEADS,
     LAYERS  = 4,
-    FIELDS  = 11,
-    SLOTS   = 5 + FIELDS * LAYERS,
-    PARAMS  = 2 * VOCAB * EMB + CTX * EMB + 2 * EMB +
-              LAYERS * (3 * EMB * EMB + 2 * EMB * HID + HID + 5 * EMB),
-    SCRATCH = 2 * VOCAB + LAYERS * (16 * EMB + 4 * HID + 2 * HEADS * CTX)
+    FIELDS  = 13,
+    SLOTS   = 4 + FIELDS * LAYERS,
+    PARAMS  = VOCAB * EMB + CTX * EMB + 2 * EMB +
+              LAYERS * (4 * EMB * EMB + 2 * EMB * HID + HID + 6 * EMB),
+    SCRATCH = 2 * VOCAB + LAYERS * (24 * EMB + 4 * HID + 4 * HEADS * CTX),
+    CHUNK   = 1 << 16
 };
+
+enum { SPACE, LETTER, DIGIT, OTHER };
 
 #define TILE 8
 #define MSL_TEXT(...) #__VA_ARGS__
@@ -100,6 +104,8 @@ struct layer {
     float * wq;
     float * wk;
     float * wv;
+    float * wo;
+    float * bo;
     struct affine ln2;
     float * lin1;
     float * b1;
@@ -113,7 +119,6 @@ union weights {
         float * pos;
         struct layer layers[LAYERS];
         struct affine lnf;
-        float * head;
     };
     float * slot[SLOTS];
 };
@@ -130,14 +135,29 @@ struct layer_cache {
     float * k;
     float * v;
     float * att;
+    float * kept;
+    float * mix;
+    float * drop1;
     struct norm n2;
     float * pre;
     float * post;
+    float * drop2;
 };
 
 struct cache {
     struct layer_cache layers[LAYERS];
     struct norm nf;
+    float * mask;
+};
+
+struct optimizer {
+    union weights d;
+    union weights m;
+    union weights v;
+    int32_t t;
+    int32_t total;
+    float lr;
+    float drop;
 };
 
 _Static_assert(sizeof(union weights) == SLOTS * sizeof(float *), "slots");
@@ -148,6 +168,8 @@ static float * heap;
 static size_t heap_size;
 static size_t heap_used;
 static int32_t gpu_share = 30;
+static float drop;
+static uint64_t seed;
 static id<MTLDevice> device;
 static id<MTLCommandQueue> queue;
 static id<MTLBuffer> heap_buffer;
@@ -176,6 +198,11 @@ static int32_t option_int(const char * key, int32_t fallback) {
     return value != NULL ? atoi(value) : fallback;
 }
 
+static float option_float(const char * key, float fallback) {
+    const char * value = option(key, NULL);
+    return value != NULL ? (float)atof(value) : fallback;
+}
+
 static double seconds(void) {
     struct timespec t = { 0 };
     clock_gettime(CLOCK_MONOTONIC, &t);
@@ -186,8 +213,18 @@ static int32_t min_of(int32_t a, int32_t b) {
     return a < b ? a : b;
 }
 
-static float uniform(float scale) {
-    return ((float)rand() / (float)RAND_MAX) * 2.0f * scale - scale;
+static uint32_t random32(void) {
+    seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+    return (uint32_t)(seed >> 32);
+}
+
+static float chance(void) {
+    return (float)(random32() >> 8) / (float)(1 << 24);
+}
+
+static float gauss(float scale) {
+    const float radius = sqrtf(-2.0f * logf(1.0f - chance()));
+    return scale * radius * cosf(2.0f * (float)M_PI * chance());
 }
 
 static void heap_open(int32_t tokens) {
@@ -435,15 +472,15 @@ static float gelu_prime(float x) {
 
 static int32_t slot_size(int32_t i) {
     static const int32_t fields[FIELDS] = {
-        EMB, EMB, EMB * EMB, EMB * EMB, EMB * EMB,
+        EMB, EMB, EMB * EMB, EMB * EMB, EMB * EMB, EMB * EMB, EMB,
         EMB, EMB, EMB * HID, HID, HID * EMB, EMB
     };
     int32_t size = EMB;
-    if (i == 0 || i == SLOTS - 1) {
+    if (i == 0) {
         size = VOCAB * EMB;
     } else if (i == 1) {
         size = CTX * EMB;
-    } else if (i < SLOTS - 3) {
+    } else if (i < SLOTS - 2) {
         size = fields[(i - 2) % FIELDS];
     }
     return size;
@@ -454,7 +491,7 @@ static union weights weights_take(void) {
     for (int32_t i = 0; i < SLOTS; i++) {
         w.slot[i] = take(slot_size(i));
     }
-    assert(w.head + VOCAB * EMB == w.tok + PARAMS);
+    assert(w.lnf.shift + EMB == w.tok + PARAMS);
     return w;
 }
 
@@ -466,16 +503,19 @@ static void fill(float * p, int32_t n, float value) {
 
 static void randomize(float * p, int32_t n, float scale) {
     for (int32_t i = 0; i < n; i++) {
-        p[i] = uniform(scale);
+        p[i] = gauss(scale);
     }
 }
 
 static union weights weights_new(void) {
+    const float deep = 0.02f / sqrtf(2.0f * LAYERS);
     union weights w = weights_take();
     for (int32_t i = 0; i < SLOTS; i++) {
         randomize(w.slot[i], slot_size(i) > HID ? slot_size(i) : 0, 0.02f);
     }
     for (int32_t i = 0; i < LAYERS; i++) {
+        randomize(w.layers[i].wo, EMB * EMB, deep);
+        randomize(w.layers[i].lin2, HID * EMB, deep);
         fill(w.layers[i].ln1.scale, EMB, 1.0f);
         fill(w.layers[i].ln2.scale, EMB, 1.0f);
     }
@@ -486,7 +526,8 @@ static union weights weights_new(void) {
 static bool weights_load(union weights * w, const char * path) {
     FILE * f = fopen(path, "rb");
     const bool ok = f != NULL &&
-                    fread(w->tok, sizeof(float), PARAMS, f) == PARAMS;
+                    fread(w->tok, sizeof(float), PARAMS, f) == PARAMS &&
+                    fgetc(f) == EOF;
     if (f != NULL) {
         fclose(f);
     }
@@ -545,31 +586,67 @@ static void norm_backward(const struct affine * a, struct affine * d,
     }
 }
 
-static void causal_softmax(float * att, int32_t t) {
+static void causal_softmax(float * att, int32_t rows, int32_t t,
+                           int32_t from) {
     const float scale = 1.0f / sqrtf((float)HEAD);
-    for (int32_t q = 0; q < t; q++) {
+    for (int32_t q = 0; q < rows; q++) {
+        const int32_t open = from + q + 1;
         float * row = att + q * t;
-        for (int32_t k = 0; k <= q; k++) {
+        for (int32_t k = 0; k < open; k++) {
             row[k] *= scale;
         }
-        softmax(row, q + 1);
-        fill(row + q + 1, t - q - 1, 0.0f);
+        softmax(row, open);
+        fill(row + open, t - open, 0.0f);
     }
 }
 
-static void causal_softmax_backward(const float * att, float * d, int32_t t) {
+static void causal_softmax_backward(const float * att, const float * kept,
+                                    float * d, int32_t t) {
     const float scale = 1.0f / sqrtf((float)HEAD);
     for (int32_t q = 0; q < t; q++) {
         const float * p = att + q * t;
+        const float * z = kept + q * t;
         float * g = d + q * t;
         float dot = 0.0f;
         for (int32_t k = 0; k < t; k++) {
-            dot += p[k] * g[k];
+            dot += z[k] * g[k];
         }
         for (int32_t k = 0; k < t; k++) {
-            g[k] = p[k] * (g[k] - dot) * scale;
+            g[k] = (z[k] * g[k] - p[k] * dot) * scale;
         }
     }
+}
+
+static float * mask_take(int32_t n) {
+    float * mask = take(n);
+    for (int32_t i = 0; i < n; i++) {
+        const bool keep = drop == 0.0f || chance() >= drop;
+        mask[i] = keep ? 1.0f / (1.0f - drop) : 0.0f;
+    }
+    return mask;
+}
+
+static float * times(const float * y, const float * mask, int32_t n) {
+    float * z = take(n);
+    for (int32_t i = 0; i < n; i++) {
+        z[i] = y[i] * mask[i];
+    }
+    return z;
+}
+
+static float * residual(float * x, const float * out, int32_t n) {
+    float * mask = mask_take(n);
+    add_rows(x, times(out, mask, n), 1, n);
+    return mask;
+}
+
+static struct cache cache_take(int32_t n) {
+    struct cache c = { 0 };
+    for (int32_t i = 0; i < LAYERS; i++) {
+        c.layers[i].k = take(n * EMB);
+        c.layers[i].v = take(n * EMB);
+    }
+    return c;
 }
 
 static int32_t head_at(int32_t i, int32_t t) {
@@ -577,22 +654,33 @@ static int32_t head_at(int32_t i, int32_t t) {
 }
 
 static void attention(const struct layer * w, struct layer_cache * c,
-                      float * x, int32_t b, int32_t t) {
-    const int32_t n = b * t;
+                      float * x, int32_t b, int32_t t, int32_t from) {
+    const int32_t rows = t - from;
+    const int32_t n = b * rows;
+    const int32_t maps = b * HEADS * rows * t;
+    float * out = take(n * EMB);
     c->q = take(n * EMB);
-    c->k = take(n * EMB);
-    c->v = take(n * EMB);
-    c->att = take(b * HEADS * t * t);
+    c->att = take(maps);
+    c->mix = take(n * EMB);
+    fill(c->k + from * EMB, n * EMB, 0.0f);
+    fill(c->v + from * EMB, n * EMB, 0.0f);
     linear(c->n1.y, w->wq, c->q, n, EMB, EMB);
-    linear(c->n1.y, w->wk, c->k, n, EMB, EMB);
-    linear(c->n1.y, w->wv, c->v, n, EMB, EMB);
+    linear(c->n1.y, w->wk, c->k + from * EMB, n, EMB, EMB);
+    linear(c->n1.y, w->wv, c->v + from * EMB, n, EMB, EMB);
     for (int32_t i = 0; i < b * HEADS; i++) {
-        const int32_t at = head_at(i, t);
-        float * att = c->att + i * t * t;
-        gemm(false, true, t, t, HEAD, c->q + at, EMB, c->k + at, EMB, att, t);
-        causal_softmax(att, t);
-        gemm(false, false, t, HEAD, t, att, t, c->v + at, EMB, x + at, EMB);
+        float * att = c->att + i * rows * t;
+        gemm(false, true, rows, t, HEAD, c->q + head_at(i, rows), EMB,
+             c->k + head_at(i, t), EMB, att, t);
+        causal_softmax(att, rows, t, from);
     }
+    c->kept = times(c->att, mask_take(maps), maps);
+    for (int32_t i = 0; i < b * HEADS; i++) {
+        gemm(false, false, rows, HEAD, t, c->kept + i * rows * t, t,
+             c->v + head_at(i, t), EMB, c->mix + head_at(i, rows), EMB);
+    }
+    add_rows(out, w->bo, n, EMB);
+    linear(c->mix, w->wo, out, n, EMB, EMB);
+    c->drop1 = residual(x, out, n * EMB);
 }
 
 static float * attention_backward(const struct layer * w, struct layer * d,
@@ -603,14 +691,17 @@ static float * attention_backward(const struct layer * w, struct layer * d,
     float * dk = take(n * EMB);
     float * dv = take(n * EMB);
     float * datt = take(b * HEADS * t * t);
+    float * dmix = take(n * EMB);
     float * dx = take(n * EMB);
+    sum_rows(g, d->bo, n, EMB);
+    linear_backward(c->mix, w->wo, g, d->wo, dmix, n, EMB, EMB);
     for (int32_t i = 0; i < b * HEADS; i++) {
         const int32_t at = head_at(i, t);
-        const float * att = c->att + i * t * t;
+        const float * kept = c->kept + i * t * t;
         float * ds = datt + i * t * t;
-        gemm(false, true, t, t, HEAD, g + at, EMB, c->v + at, EMB, ds, t);
-        gemm(true, false, t, HEAD, t, att, t, g + at, EMB, dv + at, EMB);
-        causal_softmax_backward(att, ds, t);
+        gemm(false, true, t, t, HEAD, dmix + at, EMB, c->v + at, EMB, ds, t);
+        gemm(true, false, t, HEAD, t, kept, t, dmix + at, EMB, dv + at, EMB);
+        causal_softmax_backward(c->att + i * t * t, kept, ds, t);
         gemm(false, false, t, HEAD, t, ds, t, c->k + at, EMB, dq + at, EMB);
         gemm(true, false, t, HEAD, t, ds, t, c->q + at, EMB, dk + at, EMB);
     }
@@ -622,6 +713,7 @@ static float * attention_backward(const struct layer * w, struct layer * d,
 
 static void feed_forward(const struct layer * w, struct layer_cache * c,
                          float * x, int32_t n) {
+    float * out = take(n * EMB);
     c->pre = take(n * HID);
     c->post = take(n * HID);
     add_rows(c->pre, w->b1, n, HID);
@@ -629,8 +721,9 @@ static void feed_forward(const struct layer * w, struct layer_cache * c,
     for (int32_t i = 0; i < n * HID; i++) {
         c->post[i] = gelu(c->pre[i]);
     }
-    add_rows(x, w->b2, n, EMB);
-    linear(c->post, w->lin2, x, n, HID, EMB);
+    add_rows(out, w->b2, n, EMB);
+    linear(c->post, w->lin2, out, n, HID, EMB);
+    c->drop2 = residual(x, out, n * EMB);
 }
 
 static float * feed_backward(const struct layer * w, struct layer * d,
@@ -649,21 +742,26 @@ static float * feed_backward(const struct layer * w, struct layer * d,
 }
 
 static float * forward(const union weights * w, struct cache * c,
-                       const int32_t * ids, int32_t b, int32_t t) {
-    const int32_t n = b * t;
-    float * x = take(n * EMB);
+                       const int32_t * ids, int32_t b, int32_t t,
+                       int32_t from) {
+    const int32_t n = b * (t - from);
+    float * raw = take(n * EMB);
     float * logits = take(n * VOCAB);
+    assert(from == 0 || b == 1);
     for (int32_t i = 0; i < n * EMB; i++) {
-        x[i] = w->tok[ids[i / EMB] * EMB + i % EMB] + w->pos[i % (t * EMB)];
+        raw[i] = w->tok[ids[from + i / EMB] * EMB + i % EMB] +
+                 w->pos[(from * EMB + i) % (t * EMB)];
     }
+    c->mask = mask_take(n * EMB);
+    float * x = times(raw, c->mask, n * EMB);
     for (int32_t i = 0; i < LAYERS; i++) {
         c->layers[i].n1 = norm_forward(&w->layers[i].ln1, x, n);
-        attention(&w->layers[i], &c->layers[i], x, b, t);
+        attention(&w->layers[i], &c->layers[i], x, b, t, from);
         c->layers[i].n2 = norm_forward(&w->layers[i].ln2, x, n);
         feed_forward(&w->layers[i], &c->layers[i], x, n);
     }
     c->nf = norm_forward(&w->lnf, x, n);
-    linear(c->nf.y, w->head, logits, n, EMB, VOCAB);
+    gemm(false, true, n, VOCAB, EMB, c->nf.y, EMB, w->tok, EMB, logits, VOCAB);
     return logits;
 }
 
@@ -677,43 +775,53 @@ static double cross_entropy(float * logits, const int32_t * targets,
     return -sum / n;
 }
 
-static void backward(const union weights * w, union weights * d,
-                     const struct cache * c, float * probs,
-                     const int32_t * ids, int32_t b, int32_t t) {
-    const int32_t n = b * t;
-    float * dnf = take(n * EMB);
-    float * g = take(n * EMB);
+static void cross_entropy_backward(float * probs, const int32_t * targets,
+                                   int32_t n) {
     for (int32_t i = 0; i < n; i++) {
-        probs[i * VOCAB + ids[i + 1]] -= 1.0f;
+        probs[i * VOCAB + targets[i]] -= 1.0f;
     }
     for (int32_t i = 0; i < n * VOCAB; i++) {
         probs[i] /= (float)n;
     }
-    linear_backward(c->nf.y, w->head, probs, d->head, dnf, n, EMB, VOCAB);
+}
+
+static void backward(const union weights * w, union weights * d,
+                     const struct cache * c, const float * probs,
+                     const int32_t * ids, int32_t b, int32_t t) {
+    const int32_t n = b * t;
+    float * dnf = take(n * EMB);
+    float * g = take(n * EMB);
+    gemm(true, false, VOCAB, EMB, n, probs, VOCAB, c->nf.y, EMB, d->tok, EMB);
+    gemm(false, false, n, EMB, VOCAB, probs, VOCAB, w->tok, EMB, dnf, EMB);
     norm_backward(&w->lnf, &d->lnf, &c->nf, dnf, g, n);
     for (int32_t i = LAYERS - 1; i >= 0; i--) {
         const struct layer * wi = &w->layers[i];
         const struct layer_cache * ci = &c->layers[i];
         struct layer * di = &d->layers[i];
-        const float * dn2 = feed_backward(wi, di, ci, g, n);
+        const float * g2 = times(g, ci->drop2, n * EMB);
+        const float * dn2 = feed_backward(wi, di, ci, g2, n);
         norm_backward(&wi->ln2, &di->ln2, &ci->n2, dn2, g, n);
-        const float * dn1 = attention_backward(wi, di, ci, g, b, t);
+        const float * g1 = times(g, ci->drop1, n * EMB);
+        const float * dn1 = attention_backward(wi, di, ci, g1, b, t);
         norm_backward(&wi->ln1, &di->ln1, &ci->n1, dn1, g, n);
     }
+    const float * ge = times(g, c->mask, n * EMB);
     for (int32_t i = 0; i < n * EMB; i++) {
-        d->tok[ids[i / EMB] * EMB + i % EMB] += g[i];
-        d->pos[i % (t * EMB)] += g[i];
+        d->tok[ids[i / EMB] * EMB + i % EMB] += ge[i];
+        d->pos[i % (t * EMB)] += ge[i];
     }
 }
 
 static double step(const union weights * w, union weights * d,
-                   const int32_t * ids, int32_t b, int32_t t) {
+                   const int32_t * ids, const int32_t * targets, int32_t b,
+                   int32_t t) {
     const size_t mark = heap_used;
-    struct cache c = { 0 };
-    float * logits = forward(w, &c, ids, b, t);
-    const double loss = cross_entropy(logits, ids + 1, b * t);
+    struct cache c = cache_take(b * t);
+    float * logits = forward(w, &c, ids, b, t, 0);
+    const double loss = cross_entropy(logits, targets, b * t);
     if (d != NULL) {
         memset(d->tok, 0, PARAMS * sizeof(float));
+        cross_entropy_backward(logits, targets, b * t);
         backward(w, d, &c, logits, ids, b, t);
     }
     heap_used = mark;
@@ -729,23 +837,77 @@ static double evaluate(const union weights * w, const int32_t * ids,
     const int32_t windows = windows_of(n);
     double sum = 0.0;
     for (int32_t i = 0; i < windows; i += batch) {
-        sum += step(w, NULL, ids + i * CTX, min_of(batch, windows - i), CTX);
+        const int32_t * x = ids + i * CTX;
+        sum += step(w, NULL, x, x + 1, min_of(batch, windows - i), CTX);
     }
     return sum / ((windows + batch - 1) / batch);
 }
 
-static void adamw(float * w, const float * g, float * m, float * v,
-                  int32_t t) {
-    const float lr = 1e-3f;
+static float schedule(int32_t step, int32_t total) {
+    const int32_t warm = total / 20;
+    const float turn = (float)(step - warm) / (float)(total - warm);
+    return step < warm ? (float)(step + 1) / (float)warm :
+                         0.55f + 0.45f * cosf((float)M_PI * turn);
+}
+
+static float clip_scale(const float * g, int32_t n, float max) {
+    double sum = 0.0;
+    for (int32_t i = 0; i < n; i++) {
+        sum += (double)g[i] * g[i];
+    }
+    const float norm = (float)sqrt(sum);
+    return norm > max ? max / norm : 1.0f;
+}
+
+static void update(union weights * w, struct optimizer * o) {
     const float b1 = 0.9f;
     const float b2 = 0.999f;
-    const float c1 = 1.0f - powf(b1, (float)t);
-    const float c2 = 1.0f - powf(b2, (float)t);
-    for (int32_t i = 0; i < PARAMS; i++) {
-        m[i] = b1 * m[i] + (1.0f - b1) * g[i];
-        v[i] = b2 * v[i] + (1.0f - b2) * g[i] * g[i];
-        w[i] -= lr * (m[i] / c1 / (sqrtf(v[i] / c2) + 1e-8f) + 0.1f * w[i]);
+    const float lr = o->lr * schedule(o->t, o->total);
+    const float shrink = clip_scale(o->d.tok, PARAMS, 1.0f);
+    o->t++;
+    const float c1 = 1.0f - powf(b1, (float)o->t);
+    const float c2 = 1.0f - powf(b2, (float)o->t);
+    for (int32_t s = 0; s < SLOTS; s++) {
+        const float decay = slot_size(s) > HID ? 0.1f : 0.0f;
+        float * p = w->slot[s];
+        float * m = o->m.slot[s];
+        float * v = o->v.slot[s];
+        for (int32_t i = 0; i < slot_size(s); i++) {
+            const float g = o->d.slot[s][i] * shrink;
+            m[i] = b1 * m[i] + (1.0f - b1) * g;
+            v[i] = b2 * v[i] + (1.0f - b2) * g * g;
+            p[i] -= lr * (m[i] / c1 / (sqrtf(v[i] / c2) + 1e-8f) +
+                          decay * p[i]);
+        }
     }
+}
+
+static void batch_draw(const int32_t * ids, int32_t n, int32_t * x,
+                       int32_t * y, int32_t b) {
+    const size_t size = CTX * sizeof(int32_t);
+    for (int32_t i = 0; i < b; i++) {
+        const int32_t at = (int32_t)(random32() % (uint32_t)(n - CTX));
+        memcpy(x + i * CTX, ids + at, size);
+        memcpy(y + i * CTX, ids + at + 1, size);
+    }
+}
+
+static double epoch_train(union weights * w, struct optimizer * o,
+                          const int32_t * ids, int32_t n, int32_t batch) {
+    const int32_t steps = windows_of(n) / batch;
+    int32_t * x = malloc(2 * (size_t)batch * CTX * sizeof(int32_t));
+    int32_t * y = x + batch * CTX;
+    double sum = 0.0;
+    must(x != NULL, "batch");
+    drop = o->drop;
+    for (int32_t i = 0; i < steps; i++) {
+        batch_draw(ids, n, x, y, batch);
+        sum += step(w, &o->d, x, y, batch, CTX);
+        update(w, o);
+    }
+    drop = 0.0f;
+    free(x);
+    return sum / steps;
 }
 
 static char * file_read(const char * path, int32_t * size) {
@@ -789,11 +951,35 @@ static void tokenizer_save(const struct tokenizer * tk, const char * path) {
     fclose(f);
 }
 
+static int32_t kind(const char * s, int32_t i) {
+    const uint8_t c = (uint8_t)s[i];
+    const bool quote = c == '\'' && isalpha((uint8_t)s[i + 1]);
+    int32_t k = OTHER;
+    if (isspace(c)) {
+        k = SPACE;
+    } else if (isalpha(c) || c >= 128 || quote) {
+        k = LETTER;
+    } else if (isdigit(c)) {
+        k = DIGIT;
+    }
+    return k;
+}
+
+static bool chunk_start(const char * s, int32_t i) {
+    const int32_t k = kind(s, i);
+    const bool led = s[i - 1] == ' ' && k != SPACE;
+    const bool lead = s[i] == ' ' && kind(s, i + 1) != SPACE;
+    const bool clitic = s[i] == '\'' && k == LETTER &&
+                        kind(s, i - 1) == LETTER;
+    return !led && (lead || clitic || k != kind(s, i - 1));
+}
+
 static int32_t * bytes_to_ids(const char * text, int32_t n, int32_t room) {
     int32_t * ids = malloc((size_t)(n + room) * sizeof(int32_t));
     must(ids != NULL, "ids");
     for (int32_t i = 0; i < n; i++) {
-        ids[i] = (uint8_t)text[i];
+        const bool start = i == 0 || chunk_start(text, i);
+        ids[i] = (uint8_t)text[i] | (start ? CHUNK : 0);
     }
     return ids;
 }
@@ -803,25 +989,34 @@ static int32_t merge_pair(int32_t * ids, int32_t n, struct merge m,
     int32_t k = 0;
     int32_t i = 0;
     while (i < n) {
-        const bool hit = i + 1 < n && ids[i] == m.p0 && ids[i + 1] == m.p1;
-        ids[k] = hit ? id : ids[i];
+        const bool hit = i + 1 < n && (ids[i] & ~CHUNK) == m.p0 &&
+                         ids[i + 1] == m.p1;
+        ids[k] = hit ? id | (ids[i] & CHUNK) : ids[i];
         k++;
         i += hit ? 2 : 1;
     }
     return k;
 }
 
+static int32_t pair_at(const int32_t * ids, int32_t i) {
+    return (ids[i] & ~CHUNK) * VOCAB + ids[i + 1];
+}
+
 static int32_t pair_best(const int32_t * ids, int32_t n, int32_t * counts) {
-    int32_t best = 0;
+    int32_t best = -1;
     int32_t max = 0;
     for (int32_t i = 0; i + 1 < n; i++) {
-        counts[ids[i] * VOCAB + ids[i + 1]]++;
+        if (ids[i + 1] < CHUNK) {
+            counts[pair_at(ids, i)]++;
+        }
     }
     for (int32_t i = 0; i + 1 < n; i++) {
-        int32_t * count = &counts[ids[i] * VOCAB + ids[i + 1]];
-        best = *count > max ? i : best;
-        max = *count > max ? *count : max;
-        *count = 0;
+        if (ids[i + 1] < CHUNK) {
+            int32_t * count = &counts[pair_at(ids, i)];
+            best = *count > max ? i : best;
+            max = *count > max ? *count : max;
+            *count = 0;
+        }
     }
     return best;
 }
@@ -829,6 +1024,9 @@ static int32_t pair_best(const int32_t * ids, int32_t n, int32_t * counts) {
 static int32_t encode(const struct tokenizer * tk, int32_t * ids, int32_t n) {
     for (int32_t i = 0; i < tk->count; i++) {
         n = merge_pair(ids, n, tk->merges[i], 256 + i);
+    }
+    for (int32_t i = 0; i < n; i++) {
+        ids[i] &= ~CHUNK;
     }
     return n;
 }
@@ -842,51 +1040,80 @@ static void token_print(const struct tokenizer * tk, int32_t id) {
     }
 }
 
-static int32_t next_token(const union weights * w, const int32_t * ids,
-                          int32_t n) {
-    const size_t mark = heap_used;
-    const int32_t t = min_of(n, CTX);
-    struct cache c = { 0 };
-    const float * last = forward(w, &c, ids + n - t, 1, t) + (t - 1) * VOCAB;
-    int32_t best = 0;
-    for (int32_t i = 1; i < VOCAB; i++) {
-        best = last[i] > last[best] ? i : best;
+static float largest(const float * p, int32_t n, int32_t rank) {
+    float bound = INFINITY;
+    for (int32_t r = 0; r < rank; r++) {
+        float best = -INFINITY;
+        for (int32_t i = 0; i < n; i++) {
+            best = p[i] < bound && p[i] > best ? p[i] : best;
+        }
+        bound = best;
     }
-    heap_used = mark;
-    return best;
+    return bound;
+}
+
+static int32_t sample(float * p, int32_t n, float temp, int32_t top) {
+    const float bound = largest(p, n, top);
+    for (int32_t i = 0; i < n; i++) {
+        p[i] = p[i] >= bound ? p[i] / temp : -INFINITY;
+    }
+    softmax(p, n);
+    const float r = chance();
+    float sum = p[0];
+    int32_t pick = 0;
+    for (int32_t i = 1; i < n; i++) {
+        pick = sum <= r && p[i] > 0.0f ? i : pick;
+        sum += p[i];
+    }
+    return pick;
 }
 
 static void generate(const union weights * w, const struct tokenizer * tk,
                      const char * prompt, int32_t more) {
+    const float temp = option_float("temp", 0.8f);
+    const int32_t top = option_int("top", 40);
     const int32_t bytes = (int32_t)strlen(prompt);
     must(bytes > 0 && more >= 0, "prompt or tokens");
+    must(temp > 0.0f && top > 0, "temp or top");
     int32_t * ids = bytes_to_ids(prompt, bytes, more);
-    int32_t n = encode(tk, ids, bytes);
-    for (int32_t end = n + more; n < end; n++) {
-        ids[n] = next_token(w, ids, n);
+    const int32_t start = encode(tk, ids, bytes);
+    struct cache c = cache_take(CTX);
+    const size_t mark = heap_used;
+    for (int32_t n = start; n < start + more; n++) {
+        const int32_t t = min_of(n, CTX);
+        const int32_t from = n > CTX || n == start ? 0 : n - 1;
+        float * logits = forward(w, &c, ids + n - t, 1, t, from);
+        ids[n] = sample(logits + (t - from - 1) * VOCAB, VOCAB, temp, top);
+        heap_used = mark;
     }
-    for (int32_t i = 0; i < n; i++) {
+    for (int32_t i = 0; i < start + more; i++) {
         token_print(tk, ids[i]);
     }
     putchar('\n');
     free(ids);
 }
 
+static int32_t fit_of(int32_t n) {
+    return (int32_t)((int64_t)n * 9 / 10);
+}
+
 static int32_t bpe(void) {
     const char * path = args[3];
-    int32_t bytes = 0;
-    char * text = file_read(args[2], &bytes);
+    int32_t size = 0;
+    char * text = file_read(args[2], &size);
+    const int32_t bytes = fit_of(size);
     int32_t * ids = bytes_to_ids(text, bytes, 0);
     int32_t * counts = calloc(VOCAB * VOCAB, sizeof(int32_t));
     must(counts != NULL, "counts");
     struct tokenizer tk = { 0 };
     int32_t n = bytes;
-    while (tk.count < MERGES && n > 1) {
-        const int32_t i = pair_best(ids, n, counts);
-        const struct merge m = { ids[i], ids[i + 1] };
+    int32_t at = pair_best(ids, n, counts);
+    while (tk.count < MERGES && at >= 0) {
+        const struct merge m = { ids[at] & ~CHUNK, ids[at + 1] };
         tk.merges[tk.count] = m;
         n = merge_pair(ids, n, m, 256 + tk.count);
         tk.count++;
+        at = pair_best(ids, n, counts);
     }
     tokenizer_save(&tk, path);
     printf("%d bytes -> %d tokens, %d merges -> %s\n", bytes, n, tk.count,
@@ -898,50 +1125,53 @@ static int32_t bpe(void) {
 }
 
 static int32_t train(void) {
-    const int32_t batch = option_int("batch", 2);
-    const int32_t epochs = option_int("epochs", 30);
-    const int32_t patience = option_int("patience", 1);
+    const int32_t batch = option_int("batch", 16);
+    const int32_t epochs = option_int("epochs", 20);
+    const int32_t patience = option_int("patience", 2);
+    struct optimizer o = { .lr = option_float("lr", 1e-3f),
+                           .drop = option_float("drop", 0.1f) };
     struct tokenizer tk = { 0 };
     int32_t bytes = 0;
     must(batch > 0 && epochs > 0 && patience > 0, "batch, epochs, patience");
+    must(o.lr > 0.0f && 0.0f <= o.drop && o.drop < 1.0f, "lr or drop");
     tokenizer_load(&tk, args[2]);
     char * text = file_read(args[3], &bytes);
-    int32_t * ids = bytes_to_ids(text, bytes, 0);
-    const int32_t n = encode(&tk, ids, bytes);
-    const int32_t fit = (int32_t)((float)n * 0.9f);
+    const int32_t cut = fit_of(bytes);
+    int32_t * ids = bytes_to_ids(text, cut, 0);
+    int32_t * held = bytes_to_ids(text + cut, bytes - cut, 0);
+    const int32_t fit = encode(&tk, ids, cut);
+    const int32_t rest = encode(&tk, held, bytes - cut);
+    must(fit > CTX && rest > CTX, "corpus size");
     const int32_t steps = windows_of(fit) / batch;
-    must(steps > 0 && n - fit > CTX, "corpus size");
+    must(steps > 0, "batch size");
     heap_open(batch * CTX);
     backend_select();
     union weights w = weights_new();
-    union weights d = weights_take();
-    float * m = take(PARAMS);
-    float * v = take(PARAMS);
-    printf("%d tokens, %d steps of batch %d, gemm %s\n", n, steps, batch,
-           backend.name);
+    o.d = weights_take();
+    o.m = weights_take();
+    o.v = weights_take();
+    o.total = epochs * steps;
+    printf("%d + %d tokens, %d steps of batch %d, gemm %s\n", fit, rest,
+           steps, batch, backend.name);
     double best = INFINITY;
     int32_t stale = 0;
     for (int32_t epoch = 0; epoch < epochs && stale < patience; epoch++) {
         const double start = seconds();
-        double sum = 0.0;
-        for (int32_t i = 0; i < steps; i++) {
-            sum += step(&w, &d, ids + i * batch * CTX, batch, CTX);
-            adamw(w.tok, d.tok, m, v, epoch * steps + i + 1);
-        }
-        const double val = evaluate(&w, ids + fit, n - fit, batch);
+        const double loss = epoch_train(&w, &o, ids, fit, batch);
+        const double val = evaluate(&w, held, rest, batch);
         stale = val < best ? 0 : stale + 1;
         if (stale == 0) {
             best = val;
             weights_save(&w, "weights.bin");
         }
         printf("epoch %2d | train %.4f | val %.4f | %.1fs%s\n", epoch + 1,
-               sum / steps, val, seconds() - start,
-               stale == 0 ? " | saved" : "");
+               loss, val, seconds() - start, stale == 0 ? " | saved" : "");
     }
     must(weights_load(&w, "weights.bin"), "weights.bin");
     printf("best train %.4f | val %.4f\n", evaluate(&w, ids, fit, batch),
-           evaluate(&w, ids + fit, n - fit, batch));
+           evaluate(&w, held, rest, batch));
     generate(&w, &tk, "I HAD always thought", 30);
+    free(held);
     free(ids);
     free(text);
     return 0;
@@ -968,14 +1198,20 @@ static int32_t argmax_abs(const float * p, int32_t n) {
     return best;
 }
 
+static double replay(const union weights * w, union weights * d,
+                     const int32_t * ids, int32_t b) {
+    seed = 1;
+    return step(w, d, ids, ids + 1, b, CTX);
+}
+
 static double numeric(const union weights * w, float * p,
                       const int32_t * ids, int32_t b) {
     const float eps = 1e-2f;
     const float saved = *p;
     *p = saved + eps;
-    const double up = step(w, NULL, ids, b, CTX);
+    const double up = replay(w, NULL, ids, b);
     *p = saved - eps;
-    const double down = step(w, NULL, ids, b, CTX);
+    const double down = replay(w, NULL, ids, b);
     *p = saved;
     return (up - down) / (2.0 * eps);
 }
@@ -988,9 +1224,11 @@ static int32_t check(void) {
     union weights d = weights_take();
     int32_t ids[B * CTX + 1] = { 0 };
     for (int32_t i = 0; i <= B * CTX; i++) {
-        ids[i] = rand() % VOCAB;
+        ids[i] = random32() % VOCAB;
     }
-    step(&w, &d, ids, B, CTX);
+    drop = option_float("drop", 0.0f);
+    must(0.0f <= drop && drop < 1.0f, "drop");
+    replay(&w, &d, ids, B);
     int32_t faults = 0;
     for (int32_t i = 0; i < SLOTS; i++) {
         const int32_t at = argmax_abs(d.slot[i], slot_size(i));
@@ -1051,7 +1289,7 @@ static void bench_step(int32_t batch, int32_t rounds) {
         backend = backends[at];
         backend.min = option_int("min", backend.min);
         const double start = seconds();
-        step(&w, &d, ids, batch, CTX);
+        step(&w, &d, ids, ids + 1, batch, CTX);
         const double spent = seconds() - start;
         best[at] = i < 2 * BACKENDS || spent < best[at] ? spent : best[at];
     }
@@ -1083,9 +1321,10 @@ static int32_t usage(void) {
                     "       slm train <merges.bin> <corpus>\n"
                     "       slm run <merges.bin> <prompt>\n"
                     "       slm check | bench\n"
-                    "options: gemm=cpu|blas|metal|mps|both batch=2 epochs=30\n"
-                    "         seed=N tokens=10 min=N share=30 rounds=6\n"
-                    "         patience=1\n");
+                    "options: gemm=cpu|blas|metal|mps|both batch=16\n"
+                    "         epochs=20 patience=2 lr=1e-3 drop=0.1 seed=N\n"
+                    "         tokens=10 temp=0.8 top=40\n"
+                    "         min=N share=30 rounds=6\n");
     return 1;
 }
 
@@ -1109,7 +1348,7 @@ int main(int argc, char ** argv) {
     int32_t found = COMMANDS - 1;
     args_count = argc;
     args = argv;
-    srand((unsigned)option_int("seed", (int32_t)time(NULL)));
+    seed = (uint64_t)option_int("seed", (int32_t)time(NULL));
     for (int32_t i = 0; i < COMMANDS - 1; i++) {
         if (strcmp(commands[i].name, name) == 0 && argc >= commands[i].needs) {
             found = i;
